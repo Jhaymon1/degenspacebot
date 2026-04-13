@@ -146,20 +146,75 @@ Bot shows live USDC data with trade options`,
   )
 })
 
-// /link — Connect Telegram to DegenSpace account
+// /link CODE — links Telegram to DegenSpace account
 bot.command('link', async (ctx) => {
-  await ctx.reply(
+  const parts = ctx.message.text.split(' ')
+  
+  // If no code provided, show instructions
+  if (parts.length < 2) {
+    return ctx.reply(
 `🔗 *Link Your DegenSpace Account*
 
-To link your account:
-1. Go to *degenspacex.netlify.app*
-2. Login to your account
-3. Go to Wallet tab → Settings
-4. Copy your *Link Code*
-5. Send it here as: /verify YOUR_CODE
+1. Open *degenspacex.netlify.app*
+2. Go to Wallet tab
+3. Tap *"Link Telegram"* button
+4. You'll get a 4-digit code
+5. Send it here as: /link 1234
 
-Or register a new account:
-/register your@email.com`,
+Your code expires in 10 minutes.`,
+      { parse_mode: 'Markdown' }
+    )
+  }
+
+  const code = parts[1].trim()
+  const telegramId = ctx.from.id.toString()
+  const username = ctx.from.username || ctx.from.first_name || 'Trader'
+
+  // Find the code in Supabase
+  const { data: linkCode, error } = await supabase
+    .from('telegram_link_codes')
+    .select('*')
+    .eq('code', code)
+    .eq('used', false)
+    .gt('expires_at', new Date().toISOString())
+    .single()
+
+  if (error || !linkCode) {
+    return ctx.reply(
+`❌ Invalid or expired code.
+
+Go back to DegenSpace and generate a new code.
+Codes expire after 10 minutes.`
+    )
+  }
+
+  // Link the accounts
+  await supabase
+    .from('profiles')
+    .upsert({
+      id: linkCode.user_id,
+      telegram_id: telegramId,
+      display_name: username
+    }, { onConflict: 'id' })
+
+  // Mark code as used
+  await supabase
+    .from('telegram_link_codes')
+    .update({ used: true })
+    .eq('id', linkCode.id)
+
+  // Confirm to user
+  await ctx.reply(
+`✅ *Account Linked Successfully!*
+
+Welcome to DegenSpace Bot, *${username}*! 🎉
+
+You can now:
+• Paste any contract address to trade
+• Use /balance to check your portfolio
+• Use /leaderboard to see top traders
+
+Try pasting a contract address now! 🚀`,
     { parse_mode: 'Markdown' }
   )
 })
