@@ -727,6 +727,12 @@ Use /portfolio for full holdings breakdown`,
 
 // ================================
 // LAUNCH BOT
+// Keep-alive server for Replit free tier
+const express = require('express')
+const app = express()
+app.get('/', (req, res) => res.send('PaperDex Bot is alive! 🤖'))
+app.listen(3000, () => console.log('Keep-alive server running on port 3000'))
+
 // ================================
 bot.launch()
 console.log('🤖 DegenSpace Bot is running...')
