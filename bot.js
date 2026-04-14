@@ -170,22 +170,14 @@ Your code expires in 10 minutes.`,
   const telegramId = ctx.from.id.toString()
   const username = ctx.from.username || ctx.from.first_name || 'Trader'
 
-  // Debug: dump entire table
-  const { data: allCodes } = await supabase.from('telegram_link_codes').select('*')
-  console.log(`[/link] ALL rows in table:`, JSON.stringify(allCodes))
-
-  // Find the code in Supabase — fetch all matching rows for debug
+  // Find the code in Supabase
   const { data: allRows, error: fetchError } = await supabase
     .from('telegram_link_codes')
     .select('*')
     .eq('code', code)
 
-  console.log(`[/link] code="${code}" rows found:`, JSON.stringify(allRows), 'error:', fetchError?.message)
-
   const now = new Date().toISOString()
   const linkCode = allRows?.find(r => !r.used && r.expires_at > now)
-
-  console.log(`[/link] now=${now}, matched:`, JSON.stringify(linkCode))
 
   if (fetchError || !linkCode) {
     return ctx.reply(
