@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: degenspace-bot
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node bot.js
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false

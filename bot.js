@@ -1417,37 +1417,42 @@ setInterval(checkPriceAlerts, 60000)
 // ================================
 // EXPRESS SERVER + LAUNCH
 // ================================
+const PORT = process.env.PORT || 3000
+const WEBHOOK_URL = process.env.WEBHOOK_URL  // e.g. https://your-service.onrender.com
+
 const app = express()
 app.use(express.json())
-app.get('/', (req, res) => res.send('DegenSpace Bot is alive! 🤖'))
 
-const IS_DEPLOYED = process.env.REPLIT_DEPLOYMENT === '1'
+app.get('/', (req, res) => res.json({ status: 'ok', bot: 'DegenSpace Bot', mode: WEBHOOK_URL ? 'webhook' : 'polling' }))
+app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }))
 
-if (IS_DEPLOYED) {
-  // Production: use webhooks so dev environment can poll freely
-  const domain = (process.env.REPLIT_DOMAINS || '').split(',')[0].trim()
+if (WEBHOOK_URL) {
+  // ── Webhook mode (production on Render / any cloud) ──────────────
   const webhookPath = '/webhook'
+  const fullWebhookUrl = `${WEBHOOK_URL.replace(/\/$/, '')}${webhookPath}`
 
   app.use(bot.webhookCallback(webhookPath))
 
-  app.listen(3000, async () => {
-    console.log('Keep-alive server running on port 3000 (webhook mode)')
+  app.listen(PORT, async () => {
+    console.log(`🌐 Server running on port ${PORT} (webhook mode)`)
     try {
-      await bot.telegram.setWebhook(`https://${domain}${webhookPath}`)
-      console.log(`✅ Webhook set: https://${domain}${webhookPath}`)
+      await bot.telegram.setWebhook(fullWebhookUrl, { drop_pending_updates: true })
+      console.log(`✅ Webhook registered: ${fullWebhookUrl}`)
       console.log('🤖 DegenSpace Bot is running (webhook)...')
     } catch (e) {
       console.error('❌ Failed to set webhook:', e.message)
+      process.exit(1)
     }
   })
 } else {
-  // Development: use long-polling with retry
-  app.listen(3000, () => console.log('Keep-alive server running on port 3000 (polling mode)'))
+  // ── Polling mode (local development) ─────────────────────────────
+  app.listen(PORT, () => console.log(`🌐 Server running on port ${PORT} (polling mode)`))
 
   async function launchWithRetry(retries = 8, delay = 5000) {
     for (let i = 0; i < retries; i++) {
       try {
-        await bot.launch({ dropPendingUpdates: true })
+        await bot.telegram.deleteWebhook({ drop_pending_updates: true })
+        await bot.launch()
         console.log('🤖 DegenSpace Bot is running (polling)...')
         return
       } catch (e) {
@@ -1456,6 +1461,7 @@ if (IS_DEPLOYED) {
           await new Promise(r => setTimeout(r, delay))
           delay = Math.min(delay * 2, 60000)
         } else {
+          console.error('❌ Failed to launch bot:', e.message)
           throw e
         }
       }
@@ -1465,5 +1471,5 @@ if (IS_DEPLOYED) {
   launchWithRetry()
 }
 
-process.once('SIGINT', () => bot.stop('SIGINT'))
-process.once('SIGTERM', () => bot.stop('SIGTERM'))
+process.once('SIGINT', () => { console.log('Shutting down...'); bot.stop('SIGINT'); process.exit(0) })
+process.once('SIGTERM', () => { console.log('Shutting down...'); bot.stop('SIGTERM'); process.exit(0) })
