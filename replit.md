@@ -30,12 +30,52 @@ npm start
 - `SUPABASE_URL` — Supabase project URL
 - `SUPABASE_SERVICE_KEY` — Supabase service role key
 - `WEBHOOK_URL` — Public HTTPS URL of your service (e.g. `https://your-service.onrender.com`); omit to run in polling mode
+- `BOT_USERNAME` — Telegram bot username without the `@` (e.g. `degenspacex_bot`); used in referral links
 
 ## Required Supabase Tables
 
 Run this SQL in Supabase SQL Editor if tables don't exist:
 
 ```sql
+-- Core tables (managed by DegenSpace web app, must exist before bot is used)
+CREATE TABLE IF NOT EXISTS profiles (
+  id uuid PRIMARY KEY,
+  telegram_id text UNIQUE,
+  display_name text,
+  created_at timestamptz DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS portfolios (
+  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  user_id uuid UNIQUE REFERENCES profiles(id),
+  virtual_balance_usd numeric DEFAULT 10000,
+  starting_balance numeric DEFAULT 10000,
+  created_at timestamptz DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS holdings (
+  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  user_id uuid REFERENCES profiles(id),
+  token_address text, chain_id text, token_symbol text, token_name text,
+  amount_held numeric, avg_buy_price_usd numeric,
+  last_updated timestamptz DEFAULT now(),
+  UNIQUE(user_id, token_address)
+);
+CREATE TABLE IF NOT EXISTS trades (
+  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  user_id uuid REFERENCES profiles(id),
+  token_address text, chain_id text, token_symbol text, token_name text,
+  trade_type text, amount_usd numeric, token_amount numeric,
+  price_at_trade numeric, entry_price numeric,
+  slippage_applied numeric, fee_applied numeric,
+  created_at timestamptz DEFAULT now()
+);
+-- Required by /link command (populated by the DegenSpace web app)
+CREATE TABLE IF NOT EXISTS telegram_link_codes (
+  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  user_id uuid REFERENCES profiles(id),
+  code text UNIQUE, used boolean DEFAULT false,
+  expires_at timestamptz, created_at timestamptz DEFAULT now()
+);
+-- Bot-managed tables
 CREATE TABLE IF NOT EXISTS limit_orders (
   id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
   user_id uuid, token_address text, token_symbol text, chain_id text,
@@ -106,7 +146,7 @@ CREATE TABLE IF NOT EXISTS referrals (
 ## Architecture Notes
 
 - **State management**: In-memory Maps (`pendingTrades`, `userState`) for multi-step flows
-- **Webhook mode**: `REPLIT_DEPLOYMENT=1` triggers webhook setup on Express server (port 3000)
+- **Webhook mode**: Set `WEBHOOK_URL` env var to enable webhook setup on Express server (port 3000)
 - **Polling mode**: Dev environment uses long-polling with retry backoff
 - **Callback data**: All inline button data kept under 64 bytes (Telegram limit)
-- **Referral format**: `https://t.me/degenspacex_bot?start=DS<telegramId>`
+- **Referral format**: `https://t.me/<BOT_USERNAME>?start=DS<telegramId>`
