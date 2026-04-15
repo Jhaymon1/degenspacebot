@@ -12,6 +12,10 @@ const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY
 const bot = new Telegraf(BOT_TOKEN)
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY)
 
+bot.catch((err, ctx) => {
+  console.error(`Bot error for update ${ctx?.update?.update_id}:`, err)
+})
+
 // ================================
 // REQUIRED SUPABASE TABLES (run in SQL editor if not created):
 //
@@ -190,9 +194,10 @@ async function executeBuy(ctx, telegramId, amount) {
   const tokensReceived = (amount * (1 - slippage)) / price
 
   try {
-    await supabase.from('portfolios')
+    const { error: balanceErr } = await supabase.from('portfolios')
       .update({ virtual_balance_usd: parseFloat(portfolio.virtual_balance_usd) - totalCost })
       .eq('user_id', profile.user_id)
+    if (balanceErr) throw balanceErr
 
     const { data: existing } = await supabase.from('holdings').select('*')
       .eq('user_id', profile.user_id).eq('token_address', tokenData.address).single()
@@ -200,11 +205,12 @@ async function executeBuy(ctx, telegramId, amount) {
     if (existing) {
       const newTotal = parseFloat(existing.amount_held) + tokensReceived
       const newAvg = ((parseFloat(existing.amount_held) * parseFloat(existing.avg_buy_price_usd)) + (tokensReceived * price)) / newTotal
-      await supabase.from('holdings')
+      const { error: holdingErr } = await supabase.from('holdings')
         .update({ amount_held: newTotal, avg_buy_price_usd: newAvg, last_updated: new Date().toISOString() })
         .eq('id', existing.id)
+      if (holdingErr) throw holdingErr
     } else {
-      await supabase.from('holdings').insert({
+      const { error: holdingErr } = await supabase.from('holdings').insert({
         user_id: profile.user_id,
         token_address: tokenData.address,
         chain_id: tokenData.chainId,
@@ -213,9 +219,10 @@ async function executeBuy(ctx, telegramId, amount) {
         amount_held: tokensReceived,
         avg_buy_price_usd: price
       })
+      if (holdingErr) throw holdingErr
     }
 
-    await supabase.from('trades').insert({
+    const { error: tradeErr } = await supabase.from('trades').insert({
       user_id: profile.user_id,
       token_address: tokenData.address,
       chain_id: tokenData.chainId,
@@ -229,6 +236,7 @@ async function executeBuy(ctx, telegramId, amount) {
       slippage_applied: slippage,
       fee_applied: fee
     })
+    if (tradeErr) throw tradeErr
 
     const newBalance = parseFloat(portfolio.virtual_balance_usd) - totalCost
     await ctx.reply(
@@ -276,19 +284,22 @@ async function executeSell(ctx, telegramId, tokenAddress, percent) {
 
   try {
     const portfolio = await getPortfolio(profile.user_id)
-    await supabase.from('portfolios')
+    const { error: balanceErr } = await supabase.from('portfolios')
       .update({ virtual_balance_usd: parseFloat(portfolio.virtual_balance_usd) + proceeds })
       .eq('user_id', profile.user_id)
+    if (balanceErr) throw balanceErr
 
     if (percent >= 1) {
-      await supabase.from('holdings').delete().eq('id', holding.id)
+      const { error: holdingErr } = await supabase.from('holdings').delete().eq('id', holding.id)
+      if (holdingErr) throw holdingErr
     } else {
-      await supabase.from('holdings')
+      const { error: holdingErr } = await supabase.from('holdings')
         .update({ amount_held: parseFloat(holding.amount_held) - sellAmount, last_updated: new Date().toISOString() })
         .eq('id', holding.id)
+      if (holdingErr) throw holdingErr
     }
 
-    await supabase.from('trades').insert({
+    const { error: tradeErr } = await supabase.from('trades').insert({
       user_id: profile.user_id,
       token_address: tokenAddress,
       chain_id: holding.chain_id,
@@ -302,6 +313,7 @@ async function executeSell(ctx, telegramId, tokenAddress, percent) {
       slippage_applied: slippage,
       fee_applied: fee
     })
+    if (tradeErr) throw tradeErr
 
     const newBalance = parseFloat(portfolio.virtual_balance_usd) + proceeds
     const card = generatePnlCard(holding.token_symbol, holding.token_name, entryPrice, price, pnl, pnlPct, sellAmount, proceeds, percent)
@@ -1473,3 +1485,6 @@ if (WEBHOOK_URL) {
 
 process.once('SIGINT', () => { console.log('Shutting down...'); bot.stop('SIGINT'); process.exit(0) })
 process.once('SIGTERM', () => { console.log('Shutting down...'); bot.stop('SIGTERM'); process.exit(0) })
+
+process.on('unhandledRejection', (reason) => console.error('Unhandled rejection:', reason))
+process.on('uncaughtException', (err) => { console.error('Uncaught exception:', err); process.exit(1) })
