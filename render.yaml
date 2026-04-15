@@ -3,7 +3,7 @@ services:
     name: degenspace-bot
     env: node
     plan: free
-    buildCommand: npm install
+    buildCommand: npm ci
     startCommand: node bot.js
     healthCheckPath: /health
     envVars:
