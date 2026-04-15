@@ -122,12 +122,31 @@ async function getUserSettings(userId) {
 // PNL CARD GENERATOR
 // ================================
 
-function generatePnlCard(symbol, name, entryPrice, exitPrice, pnl, pnlPct, tokenAmount, proceeds, percent) {
+function generatePnlCard(symbol, name, entryPrice, exitPrice, pnl, pnlPct, tokenAmount, proceeds, percent, unrealized = false) {
   const isWin = pnl >= 0
   const mult = parseFloat(exitPrice) / parseFloat(entryPrice)
   const banner = isWin
     ? '🚀🟢🚀🟢🚀🟢🚀🟢🚀'
     : '💀🔴💀🔴💀🔴💀🔴💀'
+
+  if (unrealized) {
+    return `${banner}
+📊 *LIVE PnL — ${symbol}*
+${banner}
+
+📌 *${name}* (${symbol})
+🔓 Position: OPEN
+
+💰 Entry:    ${formatPrice(entryPrice)}
+🎯 Current:  ${formatPrice(exitPrice)}
+📈 Multiplier: *${mult.toFixed(2)}x*
+
+${isWin ? '🟢' : '🔴'} *Unrealized PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (${pnl >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%)*
+💼 Position Value: $${proceeds.toFixed(2)}
+
+_DegenSpace Paper Trading_`
+  }
+
   return `${banner}
 ${isWin ? '🏆' : '🪦'} *TRADE CLOSED — ${symbol}*
 ${banner}
@@ -526,7 +545,7 @@ bot.command('history', async (ctx) => {
 
   const { data: trades } = await supabase.from('trades').select('*')
     .eq('user_id', profile.user_id)
-    .order('timestamp', { ascending: false })
+    .order('created_at', { ascending: false })
     .limit(10)
 
   if (!trades || trades.length === 0) return ctx.reply('📭 No trades yet.')
@@ -534,7 +553,7 @@ bot.command('history', async (ctx) => {
   let message = `🕐 *Last ${trades.length} Trades*\n\n`
   for (const t of trades) {
     const emoji = t.trade_type === 'BUY' ? '💚' : '🔴'
-    const date = new Date(t.timestamp).toLocaleDateString()
+    const date = new Date(t.created_at || t.timestamp).toLocaleDateString()
     message += `${emoji} *${t.trade_type}* ${t.token_symbol}\n`
     message += `  $${parseFloat(t.amount_usd).toFixed(2)} @ ${formatPrice(t.price_at_trade)}\n`
     message += `  ${date}\n\n`
@@ -567,8 +586,8 @@ bot.command('pnl', async (ctx) => {
     const proceeds = amount * currentPrice
     const pnl = (currentPrice - parseFloat(h.avg_buy_price_usd)) * amount
     const pnlPct = (pnl / (parseFloat(h.avg_buy_price_usd) * amount) * 100)
-    const card = generatePnlCard(h.token_symbol, h.token_name, h.avg_buy_price_usd, currentPrice, pnl, pnlPct, amount, proceeds, 1)
-    await ctx.reply(`📊 *Live PnL — Unrealized*\n\n${card}`, { parse_mode: 'Markdown' })
+    const card = generatePnlCard(h.token_symbol, h.token_name, h.avg_buy_price_usd, currentPrice, pnl, pnlPct, amount, proceeds, 1, true)
+    await ctx.reply(card, { parse_mode: 'Markdown' })
   }
 })
 
@@ -1021,8 +1040,8 @@ bot.action(/^pnl_card_(.+)$/, async (ctx) => {
   const proceeds = amount * currentPrice
   const pnl = (currentPrice - parseFloat(holding.avg_buy_price_usd)) * amount
   const pnlPct = (pnl / (parseFloat(holding.avg_buy_price_usd) * amount) * 100)
-  const card = generatePnlCard(holding.token_symbol, holding.token_name, holding.avg_buy_price_usd, currentPrice, pnl, pnlPct, amount, proceeds, 1)
-  await ctx.reply(`📊 *Live PnL — Unrealized*\n\n${card}`, { parse_mode: 'Markdown' })
+  const card = generatePnlCard(holding.token_symbol, holding.token_name, holding.avg_buy_price_usd, currentPrice, pnl, pnlPct, amount, proceeds, 1, true)
+  await ctx.reply(card, { parse_mode: 'Markdown' })
 })
 
 // Refresh — refresh_<address>
@@ -1098,16 +1117,37 @@ async function runBalance(ctx) {
   if (!profile) return ctx.reply('❌ Account not linked. Use /link first.')
   const portfolio = await getPortfolio(profile.user_id)
   if (!portfolio) return ctx.reply('❌ No portfolio found.')
-  const pnl = portfolio.virtual_balance_usd - portfolio.starting_balance
-  const pnlPct = (pnl / portfolio.starting_balance * 100).toFixed(2)
+
+  const { data: holdings } = await supabase.from('holdings').select('*').eq('user_id', profile.user_id)
+  let holdingsValue = 0
+  if (holdings && holdings.length > 0) {
+    for (const h of holdings) {
+      try {
+        const pair = await fetchTokenData(h.token_address)
+        const cp = pair ? parseFloat(pair.priceUsd) : parseFloat(h.avg_buy_price_usd)
+        holdingsValue += cp * parseFloat(h.amount_held)
+      } catch { holdingsValue += parseFloat(h.avg_buy_price_usd) * parseFloat(h.amount_held) }
+    }
+  }
+
+  const cash = parseFloat(portfolio.virtual_balance_usd)
+  const startBal = parseFloat(portfolio.starting_balance) || 10000
+  const totalValue = cash + holdingsValue
+  const pnl = totalValue - startBal
+  const pnlPct = (pnl / startBal * 100).toFixed(2)
+
   await ctx.reply(
-`💼 *${profile.display_name || 'Your'} Portfolio*
+`💼 *${profile.display_name || 'Your'} Balance*
 
-💵 Cash: *$${parseFloat(portfolio.virtual_balance_usd).toFixed(2)}*
-🏁 Started: $${parseFloat(portfolio.starting_balance).toFixed(2)}
-${pnlEmoji(pnl)} PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (${pnl >= 0 ? '+' : ''}${pnlPct}%)
+💵 Cash:     *$${cash.toFixed(2)}*
+📦 Holdings: *$${holdingsValue.toFixed(2)}*
+━━━━━━━━━━━
+💼 Total:    *$${totalValue.toFixed(2)}*
 
-Use /portfolio to see your holdings`,
+🏁 Started: $${startBal.toFixed(2)}
+${pnlEmoji(pnl)} Overall PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (${pnl >= 0 ? '+' : ''}${pnlPct}%)
+
+Use /portfolio for full holdings breakdown`,
     { parse_mode: 'Markdown' }
   )
 }
@@ -1375,34 +1415,55 @@ setInterval(checkLimitOrders, 60000)
 setInterval(checkPriceAlerts, 60000)
 
 // ================================
-// KEEP-ALIVE SERVER
+// EXPRESS SERVER + LAUNCH
 // ================================
 const app = express()
-app.get('/', (req, res) => res.send('PaperDex Bot is alive! 🤖'))
-app.listen(3000, () => console.log('Keep-alive server running on port 3000'))
+app.use(express.json())
+app.get('/', (req, res) => res.send('DegenSpace Bot is alive! 🤖'))
 
-// ================================
-// LAUNCH WITH RETRY (handles deployed bot conflict)
-// ================================
-async function launchWithRetry(retries = 5, delay = 3000) {
-  for (let i = 0; i < retries; i++) {
+const IS_DEPLOYED = process.env.REPLIT_DEPLOYMENT === '1'
+
+if (IS_DEPLOYED) {
+  // Production: use webhooks so dev environment can poll freely
+  const domain = (process.env.REPLIT_DOMAINS || '').split(',')[0].trim()
+  const webhookPath = '/webhook'
+
+  app.use(bot.webhookCallback(webhookPath))
+
+  app.listen(3000, async () => {
+    console.log('Keep-alive server running on port 3000 (webhook mode)')
     try {
-      await bot.launch({ dropPendingUpdates: true })
-      console.log('🤖 DegenSpace Bot is running...')
-      return
+      await bot.telegram.setWebhook(`https://${domain}${webhookPath}`)
+      console.log(`✅ Webhook set: https://${domain}${webhookPath}`)
+      console.log('🤖 DegenSpace Bot is running (webhook)...')
     } catch (e) {
-      if (e.response?.error_code === 409 && i < retries - 1) {
-        console.log(`⚠️ 409 conflict — retrying in ${delay / 1000}s (attempt ${i + 1}/${retries})`)
-        await new Promise(r => setTimeout(r, delay))
-        delay *= 2
-      } else {
-        throw e
+      console.error('❌ Failed to set webhook:', e.message)
+    }
+  })
+} else {
+  // Development: use long-polling with retry
+  app.listen(3000, () => console.log('Keep-alive server running on port 3000 (polling mode)'))
+
+  async function launchWithRetry(retries = 8, delay = 5000) {
+    for (let i = 0; i < retries; i++) {
+      try {
+        await bot.launch({ dropPendingUpdates: true })
+        console.log('🤖 DegenSpace Bot is running (polling)...')
+        return
+      } catch (e) {
+        if (e.response?.error_code === 409 && i < retries - 1) {
+          console.log(`⚠️ 409 conflict — retrying in ${delay / 1000}s (attempt ${i + 1}/${retries})`)
+          await new Promise(r => setTimeout(r, delay))
+          delay = Math.min(delay * 2, 60000)
+        } else {
+          throw e
+        }
       }
     }
   }
-}
 
-launchWithRetry()
+  launchWithRetry()
+}
 
 process.once('SIGINT', () => bot.stop('SIGINT'))
 process.once('SIGTERM', () => bot.stop('SIGTERM'))
