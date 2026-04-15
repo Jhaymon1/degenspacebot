@@ -22,13 +22,14 @@ npm start
 ```
 
 **Dev mode**: Runs long-polling with exponential backoff retry (8 attempts, 5s–60s delay).
-**Production (deployed VM)**: Automatically switches to webhooks (`REPLIT_DEPLOYMENT=1`) — eliminates 409 conflicts with dev environment.
+**Production (deployed on Render / any cloud)**: Set the `WEBHOOK_URL` environment variable to your service URL — the bot automatically registers a webhook and eliminates 409 conflicts with dev environment.
 
 ## Required Secrets
 
 - `BOT_TOKEN` — Telegram bot token from @BotFather
 - `SUPABASE_URL` — Supabase project URL
 - `SUPABASE_SERVICE_KEY` — Supabase service role key
+- `WEBHOOK_URL` — Public HTTPS URL of your service (e.g. `https://your-service.onrender.com`); omit to run in polling mode
 
 ## Required Supabase Tables
 
