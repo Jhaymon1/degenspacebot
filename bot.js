@@ -88,6 +88,120 @@ async function getOrCreatePortfolio(telegramId, username) {
 // Store pending trade in memory (for confirmation flow)
 const pendingTrades = new Map()
 
+// Shared buy execution logic
+async function executeBuy(ctx, telegramId, amount) {
+  const tokenData = pendingTrades.get(telegramId)
+  if (!tokenData) {
+    return ctx.reply('❌ Token data expired. Paste the contract address again.')
+  }
+
+  const { data: profile } = await supabase
+    .from('profiles')
+    .select('*')
+    .eq('telegram_id', telegramId.toString())
+    .single()
+
+  if (!profile) {
+    return ctx.reply('❌ Account not linked. Use /link to connect your DegenSpace account.')
+  }
+
+  const { data: portfolio } = await supabase
+    .from('portfolios')
+    .select('*')
+    .eq('user_id', profile.user_id)
+    .single()
+
+  if (!portfolio) {
+    return ctx.reply('❌ No portfolio found.')
+  }
+
+  if (parseFloat(portfolio.virtual_balance_usd) < amount) {
+    return ctx.reply(
+      `❌ Insufficient balance.\n\nYou have $${parseFloat(portfolio.virtual_balance_usd).toFixed(2)} but tried to spend $${amount.toFixed(2)}.`
+    )
+  }
+
+  const price = parseFloat(tokenData.priceUsd)
+  const slippage = (Math.random() * 2 + 0.5) / 100
+  const fee = tokenData.chainId === 'solana' ? 0.001 :
+              tokenData.chainId === 'ethereum' ? 0.50 : 0.10
+  const totalCost = amount + fee
+  const tokensReceived = (amount * (1 - slippage)) / price
+
+  try {
+    await supabase
+      .from('portfolios')
+      .update({ virtual_balance_usd: parseFloat(portfolio.virtual_balance_usd) - totalCost })
+      .eq('user_id', profile.user_id)
+
+    const { data: existing } = await supabase
+      .from('holdings')
+      .select('*')
+      .eq('user_id', profile.user_id)
+      .eq('token_address', tokenData.address)
+      .single()
+
+    if (existing) {
+      const newTotal = parseFloat(existing.amount_held) + tokensReceived
+      const newAvg = (
+        (parseFloat(existing.amount_held) * parseFloat(existing.avg_buy_price_usd)) +
+        (tokensReceived * price)
+      ) / newTotal
+      await supabase
+        .from('holdings')
+        .update({ amount_held: newTotal, avg_buy_price_usd: newAvg, last_updated: new Date().toISOString() })
+        .eq('id', existing.id)
+    } else {
+      await supabase
+        .from('holdings')
+        .insert({
+          user_id: profile.user_id,
+          token_address: tokenData.address,
+          chain_id: tokenData.chainId,
+          token_symbol: tokenData.symbol,
+          token_name: tokenData.name,
+          amount_held: tokensReceived,
+          avg_buy_price_usd: price
+        })
+    }
+
+    await supabase
+      .from('trades')
+      .insert({
+        user_id: profile.user_id,
+        token_address: tokenData.address,
+        chain_id: tokenData.chainId,
+        token_symbol: tokenData.symbol,
+        token_name: tokenData.name,
+        trade_type: 'BUY',
+        amount_usd: amount,
+        token_amount: tokensReceived,
+        price_at_trade: price,
+        entry_price: price,
+        slippage_applied: slippage,
+        fee_applied: fee
+      })
+
+    const newBalance = parseFloat(portfolio.virtual_balance_usd) - totalCost
+    await ctx.reply(
+`✅ *Buy Executed!*
+
+🪙 ${tokenData.symbol}
+💵 Spent: $${amount.toFixed(2)}
+🎯 Received: ${tokensReceived.toLocaleString(undefined, { maximumFractionDigits: 0 })} ${tokenData.symbol}
+📊 Price: ${formatPrice(price)}
+🔀 Slippage: ${(slippage * 100).toFixed(1)}%
+⛽ Fee: $${fee.toFixed(3)}
+
+💼 New Balance: *$${newBalance.toFixed(2)}*`,
+      { parse_mode: 'Markdown' }
+    )
+  } catch (e) {
+    await ctx.reply('❌ Trade failed. Please try again.')
+    console.error(e)
+  }
+}
+
 // ================================
 // BOT COMMANDS
 // ================================
@@ -423,6 +537,19 @@ bot.on('text', async (ctx) => {
   // Skip commands
   if (text.startsWith('/')) return
 
+  // Handle custom buy amount input
+  const telegramId = ctx.from.id
+  const pendingData = pendingTrades.get(telegramId)
+  if (pendingData?.waitingForAmount) {
+    const amount = parseFloat(text.replace(/[^0-9.]/g, ''))
+    if (isNaN(amount) || amount <= 0) {
+      return ctx.reply('❌ Invalid amount. Please enter a number like `250` or send /cancel to cancel.', { parse_mode: 'Markdown' })
+    }
+    // Clear the waiting flag and execute buy
+    pendingTrades.set(telegramId, { ...pendingData, waitingForAmount: false })
+    return executeBuy(ctx, telegramId, amount)
+  }
+
   // Detect contract address patterns
   // Solana: 32-44 base58 chars
   // EVM: 0x + 40 hex chars
@@ -494,6 +621,9 @@ bot.on('text', async (ctx) => {
         Markup.button.callback('💚 Buy $100', `buy_100`),
       ],
       [
+        Markup.button.callback('✏️ Custom Buy $', `buy_custom`),
+      ],
+      [
         Markup.button.callback('🔴 Sell 50%', `sell_50`),
         Markup.button.callback('🔴 Sell 100%', `sell_100`),
       ],
@@ -509,134 +639,33 @@ bot.on('text', async (ctx) => {
 // INLINE BUTTON HANDLERS
 // ================================
 
+// Custom buy — prompt user to type an amount
+bot.action('buy_custom', async (ctx) => {
+  await ctx.answerCbQuery()
+  const telegramId = ctx.from.id
+  const tokenData = pendingTrades.get(telegramId)
+  if (!tokenData) {
+    return ctx.reply('❌ Token data expired. Paste the contract address again.')
+  }
+  pendingTrades.set(telegramId, { ...tokenData, waitingForAmount: true })
+  await ctx.reply(
+`✏️ *Enter Custom Buy Amount*
+
+Type the amount in USD you want to spend on *${tokenData.symbol}*.
+
+Example: \`250\` or \`1500\`
+
+Send /cancel to cancel.`,
+    { parse_mode: 'Markdown' }
+  )
+})
+
 // Buy handler
 bot.action(/^buy_(\d+)$/, async (ctx) => {
   await ctx.answerCbQuery()
   const amount = parseInt(ctx.match[1])
   const telegramId = ctx.from.id
-
-  const tokenData = pendingTrades.get(telegramId)
-  if (!tokenData) {
-    return ctx.reply('❌ Token data expired. Paste the contract address again.')
-  }
-
-  const { data: profile } = await supabase
-    .from('profiles')
-    .select('*')
-    .eq('telegram_id', telegramId.toString())
-    .single()
-
-  if (!profile) {
-    return ctx.reply('❌ Account not linked. Use /link to connect your PaperDex account.')
-  }
-
-  const { data: portfolio } = await supabase
-    .from('portfolios')
-    .select('*')
-    .eq('user_id', profile.user_id)
-    .single()
-
-  if (!portfolio) {
-    return ctx.reply('❌ No portfolio found.')
-  }
-
-  if (parseFloat(portfolio.virtual_balance_usd) < amount) {
-    return ctx.reply(
-      `❌ Insufficient balance.\n\nYou have $${parseFloat(portfolio.virtual_balance_usd).toFixed(2)} but tried to spend $${amount}.`
-    )
-  }
-
-  const price = parseFloat(tokenData.priceUsd)
-  const slippage = (Math.random() * 2 + 0.5) / 100
-  const fee = tokenData.chainId === 'solana' ? 0.001 : 
-              tokenData.chainId === 'ethereum' ? 0.50 : 0.10
-  const totalCost = amount + fee
-  const tokensReceived = (amount * (1 - slippage)) / price
-
-  // Execute trade in Supabase
-  try {
-    // Deduct from portfolio
-    await supabase
-      .from('portfolios')
-      .update({ 
-        virtual_balance_usd: parseFloat(portfolio.virtual_balance_usd) - totalCost 
-      })
-      .eq('user_id', profile.user_id)
-
-    // Upsert holding
-    const { data: existing } = await supabase
-      .from('holdings')
-      .select('*')
-      .eq('user_id', profile.user_id)
-      .eq('token_address', tokenData.address)
-      .single()
-
-    if (existing) {
-      const newTotal = parseFloat(existing.amount_held) + tokensReceived
-      const newAvg = (
-        (parseFloat(existing.amount_held) * parseFloat(existing.avg_buy_price_usd)) +
-        (tokensReceived * price)
-      ) / newTotal
-
-      await supabase
-        .from('holdings')
-        .update({ 
-          amount_held: newTotal, 
-          avg_buy_price_usd: newAvg,
-          last_updated: new Date().toISOString()
-        })
-        .eq('id', existing.id)
-    } else {
-      await supabase
-        .from('holdings')
-        .insert({
-          user_id: profile.user_id,
-          token_address: tokenData.address,
-          chain_id: tokenData.chainId,
-          token_symbol: tokenData.symbol,
-          token_name: tokenData.name,
-          amount_held: tokensReceived,
-          avg_buy_price_usd: price
-        })
-    }
-
-    // Log trade
-    await supabase
-      .from('trades')
-      .insert({
-        user_id: profile.user_id,
-        token_address: tokenData.address,
-        chain_id: tokenData.chainId,
-        token_symbol: tokenData.symbol,
-        token_name: tokenData.name,
-        trade_type: 'BUY',
-        amount_usd: amount,
-        token_amount: tokensReceived,
-        price_at_trade: price,
-        entry_price: price,
-        slippage_applied: slippage,
-        fee_applied: fee
-      })
-
-    const newBalance = parseFloat(portfolio.virtual_balance_usd) - totalCost
-
-    await ctx.reply(
-`✅ *Buy Executed!*
-
-🪙 ${tokenData.symbol}
-💵 Spent: $${amount.toFixed(2)}
-🎯 Received: ${tokensReceived.toLocaleString(undefined, {maximumFractionDigits: 0})} ${tokenData.symbol}
-📊 Price: ${formatPrice(price)}
-🔀 Slippage: ${(slippage * 100).toFixed(1)}%
-⛽ Fee: $${fee.toFixed(3)}
-
-💼 New Balance: *$${newBalance.toFixed(2)}*`,
-      { parse_mode: 'Markdown' }
-    )
-  } catch (e) {
-    await ctx.reply('❌ Trade failed. Please try again.')
-    console.error(e)
-  }
+  await executeBuy(ctx, telegramId, amount)
 })
 
 // Sell handler
@@ -788,8 +817,19 @@ const app = express()
 app.get('/', (req, res) => res.send('PaperDex Bot is alive! 🤖'))
 app.listen(3000, () => console.log('Keep-alive server running on port 3000'))
 
+// /cancel — cancel pending custom input
+bot.command('cancel', async (ctx) => {
+  const telegramId = ctx.from.id
+  const pending = pendingTrades.get(telegramId)
+  if (pending?.waitingForAmount) {
+    pendingTrades.set(telegramId, { ...pending, waitingForAmount: false })
+    return ctx.reply('❌ Custom buy cancelled.')
+  }
+  return ctx.reply('Nothing to cancel.')
+})
+
 // ================================
-bot.launch()
+bot.launch({ dropPendingUpdates: true })
 console.log('🤖 DegenSpace Bot is running...')
 
 process.once('SIGINT', () => bot.stop('SIGINT'))
