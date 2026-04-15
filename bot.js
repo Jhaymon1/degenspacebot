@@ -8,6 +8,18 @@ const express = require('express')
 const BOT_TOKEN = process.env.BOT_TOKEN
 const SUPABASE_URL = process.env.SUPABASE_URL
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY
+const BOT_USERNAME = process.env.BOT_USERNAME || 'degenspacex_bot'
+
+const missingVars = [
+  ['BOT_TOKEN', BOT_TOKEN],
+  ['SUPABASE_URL', SUPABASE_URL],
+  ['SUPABASE_SERVICE_KEY', SUPABASE_KEY],
+].filter(([, v]) => !v).map(([k]) => k)
+
+if (missingVars.length > 0) {
+  console.error(`❌ Missing required environment variables: ${missingVars.join(', ')}`)
+  process.exit(1)
+}
 
 const bot = new Telegraf(BOT_TOKEN)
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY)
@@ -87,13 +99,29 @@ function formatChange(pct) {
 
 function pnlEmoji(pnl) { return pnl >= 0 ? '🟢' : '🔴' }
 
-async function fetchTokenData(address) {
-  try {
-    const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`)
-    const data = await res.json()
-    if (!data.pairs || data.pairs.length === 0) return null
-    return data.pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0]
-  } catch (e) { return null }
+async function fetchTokenData(address, retries = 3) {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${address}`)
+      if (res.status === 429) {
+        if (attempt < retries - 1) {
+          await new Promise(r => setTimeout(r, (attempt + 1) * 1000 + Math.random() * 500))
+          continue
+        }
+        return null
+      }
+      const data = await res.json()
+      if (!data.pairs || data.pairs.length === 0) return null
+      return data.pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0]
+    } catch (e) {
+      if (attempt < retries - 1) {
+        await new Promise(r => setTimeout(r, (attempt + 1) * 500))
+        continue
+      }
+      return null
+    }
+  }
+  return null
 }
 
 // ================================
@@ -447,11 +475,16 @@ Your code expires in 10 minutes.`,
     return ctx.reply('❌ Invalid or expired code.\n\nGo back to DegenSpace and generate a new code.\nCodes expire after 10 minutes.')
   }
 
-  await supabase.from('profiles').upsert(
+  const { error: profileErr } = await supabase.from('profiles').upsert(
     { id: linkCode.user_id, telegram_id: telegramId, display_name: username },
     { onConflict: 'id' }
   )
-  await supabase.from('telegram_link_codes').update({ used: true }).eq('id', linkCode.id)
+  if (profileErr) {
+    console.error('Failed to upsert profile during /link:', profileErr.message)
+    return ctx.reply('❌ Failed to link account. Please try again.')
+  }
+  const { error: codeErr } = await supabase.from('telegram_link_codes').update({ used: true }).eq('id', linkCode.id)
+  if (codeErr) console.error('Failed to mark link code used:', codeErr.message)
 
   await ctx.reply(
 `✅ *Account Linked Successfully!*
@@ -875,6 +908,7 @@ async function handleUserState(ctx, telegramId, text, state) {
     case 'settings_slippage': {
       if (isNaN(value) || value < 0.1 || value > 50) return ctx.reply('❌ Enter a value between 0.1 and 50.')
       const profile = await getProfile(telegramId)
+      if (!profile) return ctx.reply('❌ Account not linked.')
       await supabase.from('user_settings').upsert({ user_id: profile.user_id, slippage: value }, { onConflict: 'user_id' })
       userState.delete(telegramId)
       return ctx.reply(`✅ Slippage set to *${value}%*`, { parse_mode: 'Markdown' })
@@ -885,6 +919,7 @@ async function handleUserState(ctx, telegramId, text, state) {
     case 'settings_buy3': {
       if (isNaN(value) || value <= 0) return ctx.reply('❌ Invalid amount.')
       const profile = await getProfile(telegramId)
+      if (!profile) return ctx.reply('❌ Account not linked.')
       const col = state.action === 'settings_buy1' ? 'default_buy_1' : state.action === 'settings_buy2' ? 'default_buy_2' : 'default_buy_3'
       await supabase.from('user_settings').upsert({ user_id: profile.user_id, [col]: value }, { onConflict: 'user_id' })
       userState.delete(telegramId)
@@ -1331,7 +1366,7 @@ async function runReferral(ctx) {
 `🎁 *Your Referral Link*
 
 Share this with friends:
-👉 \`https://t.me/degenspacex_bot?start=${refCode}\`
+👉 \`https://t.me/${BOT_USERNAME}?start=${refCode}\`
 
 👥 Total referrals: *${refs?.length || 0}*
 
@@ -1363,30 +1398,38 @@ async function checkLimitOrders() {
 
         if (!triggered) continue
 
-        await supabase.from('limit_orders').update({ status: 'triggered' }).eq('id', order.id)
-
         const fakeCtx = {
           from: { id: parseInt(order.telegram_id) },
           reply: (msg, opts) => bot.telegram.sendMessage(order.telegram_id, msg, opts)
         }
 
-        if (order.order_type === 'LIMIT_BUY' && order.amount_usd) {
-          pendingTrades.set(parseInt(order.telegram_id), {
-            address: order.token_address, symbol: order.token_symbol,
-            name: order.token_symbol, chainId: order.chain_id, priceUsd: pair.priceUsd
-          })
+        try {
+          if (order.order_type === 'LIMIT_BUY' && order.amount_usd) {
+            pendingTrades.set(parseInt(order.telegram_id), {
+              address: order.token_address, symbol: order.token_symbol,
+              name: order.token_symbol, chainId: order.chain_id, priceUsd: pair.priceUsd
+            })
+            await bot.telegram.sendMessage(order.telegram_id,
+              `🤖 *Limit Buy Triggered!*\n\n${order.token_symbol} hit ${formatPrice(triggerPrice)}\nExecuting buy of $${parseFloat(order.amount_usd).toFixed(2)}...`,
+              { parse_mode: 'Markdown' }
+            )
+            await executeBuy(fakeCtx, parseInt(order.telegram_id), parseFloat(order.amount_usd))
+          } else if ((order.order_type === 'TAKE_PROFIT' || order.order_type === 'STOP_LOSS') && order.percent) {
+            const label = order.order_type === 'TAKE_PROFIT' ? '🎯 Take Profit' : '🛡️ Stop Loss'
+            await bot.telegram.sendMessage(order.telegram_id,
+              `🤖 *${label} Triggered!*\n\n${order.token_symbol} hit ${formatPrice(triggerPrice)}\nExecuting sell of ${(order.percent * 100).toFixed(0)}%...`,
+              { parse_mode: 'Markdown' }
+            )
+            await executeSell(fakeCtx, parseInt(order.telegram_id), order.token_address, parseFloat(order.percent))
+          }
+          await supabase.from('limit_orders').update({ status: 'triggered' }).eq('id', order.id)
+        } catch (execErr) {
+          await supabase.from('limit_orders').update({ status: 'failed' }).eq('id', order.id)
+          console.error('Order exec error:', execErr.message)
           await bot.telegram.sendMessage(order.telegram_id,
-            `🤖 *Limit Buy Triggered!*\n\n${order.token_symbol} hit ${formatPrice(triggerPrice)}\nExecuting buy of $${parseFloat(order.amount_usd).toFixed(2)}...`,
+            `❌ *Order Failed* — ${order.token_symbol}\n\nCould not execute ${order.order_type.replace(/_/g, ' ')}. Please retry manually.`,
             { parse_mode: 'Markdown' }
-          )
-          await executeBuy(fakeCtx, parseInt(order.telegram_id), parseFloat(order.amount_usd))
-        } else if ((order.order_type === 'TAKE_PROFIT' || order.order_type === 'STOP_LOSS') && order.percent) {
-          const label = order.order_type === 'TAKE_PROFIT' ? '🎯 Take Profit' : '🛡️ Stop Loss'
-          await bot.telegram.sendMessage(order.telegram_id,
-            `🤖 *${label} Triggered!*\n\n${order.token_symbol} hit ${formatPrice(triggerPrice)}\nExecuting sell of ${(order.percent * 100).toFixed(0)}%...`,
-            { parse_mode: 'Markdown' }
-          )
-          await executeSell(fakeCtx, parseInt(order.telegram_id), order.token_address, parseFloat(order.percent))
+          ).catch(() => {})
         }
       } catch (e) { console.error('Order exec error:', e.message) }
     }
@@ -1480,7 +1523,10 @@ if (WEBHOOK_URL) {
     }
   }
 
-  launchWithRetry()
+  launchWithRetry().catch(e => {
+    console.error('❌ Fatal: failed to launch bot after retries:', e.message)
+    process.exit(1)
+  })
 }
 
 process.once('SIGINT', () => { console.log('Shutting down...'); bot.stop('SIGINT'); process.exit(0) })
